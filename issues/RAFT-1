@@ -1,0 +1,8 @@
+-*-org-*-
+
+* RAFT-1 - Implement the Raft consensus protocol
+  CLOCK: [2016-01-31 Sun 09:22]
+
+** References
+
+   - http://ramcloud.stanford.edu/raft.pdf  

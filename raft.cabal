@@ -1,0 +1,27 @@
+name:                raft
+version:             0.1.0.0
+synopsis:            Raft consensus protocol
+description:         Please see README.md
+homepage:            http://github.com/ahanikel/raft
+license:             BSD3
+license-file:        LICENSE
+author:              Axel Hanikel
+maintainer:          ahanikel@gmail.com
+copyright:           2016 Axel Hanikel
+category:            Distributed
+build-type:          Simple
+-- extra-source-files:
+cabal-version:       >=1.10
+
+executable raft
+  hs-source-dirs:      src/main/haskell/raft
+  main-is:             Main.hs
+  ghc-options:         -threaded -rtsopts -with-rtsopts=-N
+  build-depends:       base
+                     , distributed-process
+                     , distributed-process-simplelocalnet
+  default-language:    Haskell2010
+
+source-repository head
+  type:     git
+  location: https://github.com/ahanikel/raft
