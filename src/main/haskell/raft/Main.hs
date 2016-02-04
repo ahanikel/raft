@@ -1,14 +1,12 @@
 {-# LANGUAGE DeriveGeneric #-}
 
 import Util (checkIO)
-import Net (transmitter, receiver)
 import Control.Monad.State (StateT, runStateT, get, put)
 import Control.Monad.Trans (lift)
-import Data.Binary (Binary)
 import qualified Data.Set as Set
 import Data.Typeable (Typeable)
 import GHC.Generics (Generic)
-import Network.Socket (Socket, getAddrInfo, socket, addrFamily, SocketType(..), defaultProtocol, SockAddr, addrAddress)
+import Network.Socket (Socket, AddrInfo, getAddrInfo, socket, addrFamily, SocketType(..), defaultProtocol, SockAddr, addrAddress, sendTo)
 import System.Environment (getArgs)
 import System.Exit (exitWith, ExitCode(..))
 import System.IO (stderr, hPutStrLn)
@@ -21,25 +19,22 @@ data Role               = Leader
 
 type Term = Integer
 
-data Actor = Self String | Peer String
-  deriving (Generic, Show, Typeable, Ord, Eq)
-
-instance Binary Actor
+data Actor = Self AddrInfo | Peer AddrInfo
+  deriving (Show, Eq)
 
 data ServerState        = ServerState { state_self  :: Actor
                                       , state_peers :: [Actor]
+                                      , state_sock  :: Socket
                                       , state_role  :: Role
                                       , state_term  :: Term
                                       }
      deriving (Show)
 
-data Message            = AppendEntries Actor Term [String]
-                        | RequestVote   Actor Term
-                        | CastVote      Actor Term Actor
+data Message            = AppendEntries Term [String]
+                        | RequestVote   Term
+                        | CastVote      Term String
                         | Timeout
-     deriving (Show, Generic, Typeable)
-
-instance Binary Message
+     deriving (Show, Read)
 
 type ApplicationContext = StateT ServerState IO
 
@@ -47,25 +42,28 @@ type Timeout = Int
 
 ------------------------------------------------
 
-getAddress :: String -> IO String
-getAddress addr = getAddrInfo Nothing (Just host) (Just port) >>= extractFirstAddress
+getAddress :: String -> IO AddrInfo
+getAddress addr = getAddrInfo Nothing (Just host) (Just port) >>= returnFirst
   where
     (host, (':' : port)) = span (/= ':') addr
-    extractFirstAddress = return . show . addrAddress . head
+    returnFirst = return . head
 
 main :: IO ()
 main = do
   let usage = "Usage: raft host:port { host:port }"
   args <- getArgs
   case args of
-    (self : peers) -> mapM getAddress args >>= \(self : peers) -> run (Self self) (fmap Peer peers)
-    otherwise      -> do hPutStrLn stderr usage
-                         exitWith $ ExitFailure 1
+    []        -> do hPutStrLn stderr usage
+                    exitWith $ ExitFailure 1
+    otherwise -> mapM getAddress args >>= \(self : peers) -> run (Self self) (fmap Peer peers)
 
 run :: Actor -> [Actor] -> IO ()
 run self peers = do
+  let Self selfInfo = self
+  let family        = addrFamily selfInfo
+  sock <- socket family Datagram defaultProtocol
   runStateT (become Follower)
-            (ServerState self peers Follower 0)
+            (ServerState self peers sock Follower 0)
   return ()
 
 become :: Role -> ApplicationContext ()
@@ -79,7 +77,7 @@ become Candidate = do
   log "I am candidate"
   newTerm
   setRole Candidate
-  broadcast $ RequestVote (state_self ctx) (state_term ctx)
+  broadcast $ RequestVote (state_term ctx)
   handleMessagesAsCandidate Set.empty
 
 become Leader    = do
@@ -89,16 +87,16 @@ become Leader    = do
 
 handleMessagesAsFollower = do
   ctx <- get
-  message <- awaitMessage messageTimeout
+  (sender, message) <- awaitMessage messageTimeout
   case message of
     Timeout -> become Candidate
-    AppendEntries sender term entries | term >= state_term ctx -> do
+    AppendEntries term entries | term >= state_term ctx -> do
       append entries
       if term > state_term ctx
       then setTerm term
       else return ()
       handleMessagesAsFollower
-    RequestVote sender term | term > state_term ctx -> do
+    RequestVote term | term > state_term ctx -> do
       setTerm term
       castVote sender
       handleMessagesAsFollower
@@ -109,17 +107,17 @@ handleMessagesAsCandidate votes = do
   if we_have_a_majority votes ctx
   then become Leader
   else do
-    message <- awaitMessage electionTimeout
+    (sender, message) <- awaitMessage electionTimeout
     case message of
-      CastVote sender term peer | is_a_peer peer && state_term ctx == term ->
+      CastVote term peer | is_a_peer peer && state_term ctx == term ->
         handleMessagesAsCandidate $ Set.insert peer votes
-      AppendEntries sender term entries | term >= state_term ctx -> do
+      AppendEntries term entries | term >= state_term ctx -> do
         if term > state_term ctx
         then setTerm term
         else return ()
         append entries
         become Follower
-      RequestVote sender term | term > state_term ctx -> do
+      RequestVote term | term > state_term ctx -> do
         setTerm term
         castVote sender
         become Follower
@@ -133,16 +131,16 @@ handleMessagesAsCandidate votes = do
 
 handleMessagesAsLeader = do
   ctx <- get
-  message <- awaitMessage messageTimeout
+  (sender, message) <- awaitMessage messageTimeout
   case message of
     Timeout -> do
       heartbeat
       handleMessagesAsLeader
-    AppendEntries sender term entries | term > state_term ctx -> do
+    AppendEntries term entries | term > state_term ctx -> do
       append entries
       setTerm term
       become Follower
-    RequestVote sender term | term > state_term ctx -> do
+    RequestVote term | term > state_term ctx -> do
       setTerm term
       castVote sender
       become Follower
@@ -163,14 +161,16 @@ setRole role = do
   ctx <- get
   put ctx { state_role = role }
 
-awaitMessage :: Timeout -> ApplicationContext Message
+awaitMessage :: Timeout -> ApplicationContext (Actor, Message)
 awaitMessage timeout = do
+  ctx <- get
+  let self = state_self ctx
   let await = lift $ expectTimeout timeout
-  await :: ApplicationContext (Maybe Message)
+  await :: ApplicationContext (Maybe (Actor, Message))
   mmessage <- await
   case mmessage of
     Just message   -> return message
-    Nothing        -> return Timeout
+    Nothing        -> return (self, Timeout)
 
 -- TODO: choose a random value between 150--300 ms
 electionTimeout :: Timeout
@@ -186,19 +186,33 @@ append entries = return ()
 heartbeat :: ApplicationContext ()
 heartbeat = do
   ctx <- get
-  broadcast $ AppendEntries (state_self ctx) (state_term ctx) []
+  broadcast $ AppendEntries (state_term ctx) []
 
 log :: String -> ApplicationContext ()
 log = lift . putStrLn
 
+send :: Message -> SockAddr -> ApplicationContext ()
+send message addr = do
+  ctx <- get
+  let sock = state_sock ctx
+  lift $ send' sock (show message) addr
+  where
+    send' _    []      _    = return ()
+    send' sock message addr = do
+      nSent <- sendTo sock message addr
+      send' sock (drop nSent message) addr
+
 broadcast :: Message -> ApplicationContext ()
-broadcast message = undefined
+broadcast message = do
+  ctx <- get
+  let peers = state_peers ctx
+  mapM_ (\(Peer peer) -> send message $ addrAddress peer) peers
 
 castVote :: Actor -> ApplicationContext ()
 castVote recipient = undefined
 
-is_a_peer :: Actor -> Bool
+is_a_peer :: String -> Bool
 is_a_peer peer = undefined
 
-expectTimeout :: Timeout -> IO (Maybe Message)
+expectTimeout :: Timeout -> IO (Maybe (Actor, Message))
 expectTimeout timeout = undefined
