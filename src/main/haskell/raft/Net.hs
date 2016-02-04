@@ -1,34 +1,49 @@
 module Net where
 
-import Network.Socket (Socket, getAddrInfo, socket, addrFamily, Datagram, defaultProtocol)
+import Network.Socket ( Socket
+                      , getAddrInfo
+                      , socket
+                      , addrFamily
+                      , SocketType(Datagram)
+                      , defaultProtocol
+                      , close
+                      , sendTo
+                      , addrAddress
+                      , withSocketsDo
+                      , defaultHints
+                      , addrFlags
+                      , AddrInfo
+                      , AddrInfoFlag(AI_PASSIVE)
+                      , bindSocket
+                      , recvFrom
+                      , SockAddr
+                      )
 
 data Transmitter = Transmitter { t_send  :: String -> IO ()
-                               , t_close :: Socket -> IO ()
+                               , t_close :: IO ()
                                }
 
 transmitter :: String -> String -> IO Transmitter
 transmitter host port = do
-  addrInfos   <- getAddrInfo Nothing (Just host) (Just port)
-  let addrInfo = head addrInfos
-  sock        <- socket (addrFamily addrInfo) Datagram defaultProtocol
-  return $ Transmitter sendFunc (close sock)
+  addrInfo <- fmap head $ getAddrInfo Nothing (Just host) (Just port)
+  sock     <- socket (addrFamily addrInfo) Datagram defaultProtocol
+  return $ Transmitter (sendFunc sock addrInfo) (close sock)
   where
-    sendFunc :: String -> IO ()
-    sendFunc [] = return ()
-    sendFunc s  = do
+    sendFunc :: Socket -> AddrInfo -> String -> IO ()
+    sendFunc _ _ []           = return ()
+    sendFunc sock addrInfo s  = do
       nSent <- sendTo sock s (addrAddress addrInfo)
-      sendFunc (drop nSent s)
+      sendFunc sock addrInfo (drop nSent s)
 
-data Receiver = Receiver { r_receive :: IO String
-                         , r_close :: Socket -> IO ()
+data Receiver = Receiver { r_receive :: IO (String, SockAddr)
+                         , r_close   :: IO ()
                          }
 
 receiver :: String -> IO Receiver
 receiver port = withSocketsDo $ do
-  addrInfos <- getAddrInfo (Just (defaultHints { addrFlags = [ AI_PASSIVE ] }))
-                           Nothing
-                           (Just port)
-  let addrInfo = head addrInfos
+  addrInfo <- fmap head $ getAddrInfo (Just (defaultHints { addrFlags = [ AI_PASSIVE ] }))
+                                      Nothing
+                                      (Just port)
   sock <- socket (addrFamily addrInfo) Datagram defaultProtocol
   bindSocket sock (addrAddress addrInfo)
   return $ Receiver (receiveFunc sock) (close sock)

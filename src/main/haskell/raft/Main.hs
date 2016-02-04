@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 
 import Util (checkIO)
+import Net (transmitter, receiver)
 import Control.Monad.State (StateT, runStateT, get, put)
 import Control.Monad.Trans (lift)
 import Data.Binary (Binary)
