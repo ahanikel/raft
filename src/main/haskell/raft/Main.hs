@@ -2,14 +2,12 @@
 
 import Util (checkIO)
 import Control.Monad.State (StateT, runStateT, get, put)
-import Control.Distributed.Process (Process, ProcessId, expectTimeout, getSelfPid, say)
-import Control.Distributed.Process.Backend.SimpleLocalnet (initializeBackend, newLocalNode)
-import Control.Distributed.Process.Node (initRemoteTable, runProcess, LocalNode, localNodeId)
 import Control.Monad.Trans (lift)
 import Data.Binary (Binary)
 import qualified Data.Set as Set
 import Data.Typeable (Typeable)
 import GHC.Generics (Generic)
+import Network.Socket (Socket, getAddrInfo, socket, addrFamily, SocketType(..), defaultProtocol, SockAddr, addrAddress)
 import System.Environment (getArgs)
 import System.Exit (exitWith, ExitCode(..))
 import System.IO (stderr, hPutStrLn)
@@ -22,53 +20,52 @@ data Role               = Leader
 
 type Term = Integer
 
-type Peer               = String
+data Actor = Self String | Peer String
+  deriving (Generic, Show, Typeable, Ord, Eq)
 
-instance Show LocalNode where
-  show = show . localNodeId
+instance Binary Actor
 
-data ServerState        = ServerState { state_node  :: LocalNode
-                                      , state_peers :: [Peer]
+data ServerState        = ServerState { state_self  :: Actor
+                                      , state_peers :: [Actor]
                                       , state_role  :: Role
                                       , state_term  :: Term
                                       }
      deriving (Show)
 
-data Message            = AppendEntries ProcessId Term [String]
-                        | RequestVote   ProcessId Term
-                        | CastVote      ProcessId Term Peer
+data Message            = AppendEntries Actor Term [String]
+                        | RequestVote   Actor Term
+                        | CastVote      Actor Term Actor
                         | Timeout
      deriving (Show, Generic, Typeable)
 
 instance Binary Message
 
-type ApplicationContext = StateT ServerState Process
+type ApplicationContext = StateT ServerState IO
 
 type Timeout = Int
 
 ------------------------------------------------
 
-peers = ["127.0.0.1:7000"]
+getAddress :: String -> IO String
+getAddress addr = getAddrInfo Nothing (Just host) (Just port) >>= extractFirstAddress
+  where
+    (host, (':' : port)) = span (/= ':') addr
+    extractFirstAddress = return . show . addrAddress . head
 
 main :: IO ()
 main = do
   let usage = "Usage: raft host:port { host:port }"
   args <- getArgs
   case args of
-    (self : peers) -> run self peers
+    (self : peers) -> mapM getAddress args >>= \(self : peers) -> run (Self self) (fmap Peer peers)
     otherwise      -> do hPutStrLn stderr usage
                          exitWith $ ExitFailure 1
 
-run :: String -> [Peer] -> IO ()
+run :: Actor -> [Actor] -> IO ()
 run self peers = do
-  let (host, (':':port)) = span (/= ':') self
-  backend <- initializeBackend host port initRemoteTable
-  node    <- newLocalNode backend
-  runProcess node $ do
-    runStateT (become Follower)
-              (ServerState node peers Follower 0)
-    return ()
-  
+  runStateT (become Follower)
+            (ServerState self peers Follower 0)
+  return ()
 
 become :: Role -> ApplicationContext ()
 become Follower  = do
@@ -81,8 +78,7 @@ become Candidate = do
   log "I am candidate"
   newTerm
   setRole Candidate
-  myPid <- myProcessId
-  broadcast $ RequestVote myPid (state_term ctx)
+  broadcast $ RequestVote (state_self ctx) (state_term ctx)
   handleMessagesAsCandidate Set.empty
 
 become Leader    = do
@@ -116,7 +112,7 @@ handleMessagesAsCandidate votes = do
     case message of
       CastVote sender term peer | is_a_peer peer && state_term ctx == term ->
         handleMessagesAsCandidate $ Set.insert peer votes
-      AppendEntries sender term entries | term >= state_term ctx ->
+      AppendEntries sender term entries | term >= state_term ctx -> do
         if term > state_term ctx
         then setTerm term
         else return ()
@@ -132,7 +128,7 @@ handleMessagesAsCandidate votes = do
         -- instead of >
         -- TODO: check if this works (integer division, rounding)
         we_have_a_majority votes ctx =
-          Set.size votes >= length (state_peers ctx) / 2
+          Set.size votes >= length (state_peers ctx) `div` 2
 
 handleMessagesAsLeader = do
   ctx <- get
@@ -141,7 +137,7 @@ handleMessagesAsLeader = do
     Timeout -> do
       heartbeat
       handleMessagesAsLeader
-    AppendEntries sender term entries | term > state_term ctx ->
+    AppendEntries sender term entries | term > state_term ctx -> do
       append entries
       setTerm term
       become Follower
@@ -187,19 +183,21 @@ append :: [String] -> ApplicationContext ()
 append entries = return ()
 
 heartbeat :: ApplicationContext ()
-heartbeat = broadcast $ AppendEntries []
+heartbeat = do
+  ctx <- get
+  broadcast $ AppendEntries (state_self ctx) (state_term ctx) []
 
 log :: String -> ApplicationContext ()
-log = lift . say
+log = lift . putStrLn
 
 broadcast :: Message -> ApplicationContext ()
 broadcast message = undefined
 
-castVote :: ProcessId -> ApplicationContext ()
+castVote :: Actor -> ApplicationContext ()
 castVote recipient = undefined
 
-is_a_peer :: ProcessId -> Bool
+is_a_peer :: Actor -> Bool
 is_a_peer peer = undefined
 
-myProcessId :: ApplicationContext ProcessId
-myProcessId = lift . getSelfPid
+expectTimeout :: Timeout -> IO (Maybe Message)
+expectTimeout timeout = undefined

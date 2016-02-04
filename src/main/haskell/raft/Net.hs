@@ -2,16 +2,16 @@ module Net where
 
 import Network.Socket (Socket, getAddrInfo, socket, addrFamily, Datagram, defaultProtocol)
 
-data Connection = Connection { c_socket :: Socket
-                             , c_send   :: String -> IO ()
-                             }
+data Transmitter = Transmitter { t_send  :: String -> IO ()
+                               , t_close :: Socket -> IO ()
+                               }
 
-open :: String -> String -> IO Connection
-open = do
+transmitter :: String -> String -> IO Transmitter
+transmitter host port = do
   addrInfos   <- getAddrInfo Nothing (Just host) (Just port)
   let addrInfo = head addrInfos
   sock        <- socket (addrFamily addrInfo) Datagram defaultProtocol
-  return $ Connection sock sendFunc
+  return $ Transmitter sendFunc (close sock)
   where
     sendFunc :: String -> IO ()
     sendFunc [] = return ()
@@ -19,19 +19,21 @@ open = do
       nSent <- sendTo sock s (addrAddress addrInfo)
       sendFunc (drop nSent s)
 
-type HandlerFunc = SockAddr -> String -> IO ()
+data Receiver = Receiver { r_receive :: IO String
+                         , r_close :: Socket -> IO ()
+                         }
 
-receive port handlerFunc = withSocketsDo $ do
+receiver :: String -> IO Receiver
+receiver port = withSocketsDo $ do
   addrInfos <- getAddrInfo (Just (defaultHints { addrFlags = [ AI_PASSIVE ] }))
                            Nothing
                            (Just port)
   let addrInfo = head addrInfos
   sock <- socket (addrFamily addrInfo) Datagram defaultProtocol
   bindSocket sock (addrAddress addrInfo)
-  procMessages sock
+  return $ Receiver (receiveFunc sock) (close sock)
   where
-    procMessages sock = do
+    receiveFunc sock = do
       (msg, _, addr) <- recvFrom sock 1024
-      handlerFunc addr msg
       -- TODO: check timeout
-      procMessages sock
+      return (msg, addr)
