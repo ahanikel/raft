@@ -6,7 +6,7 @@ import Control.Monad.Trans (lift)
 import qualified Data.Set as Set
 import Data.Typeable (Typeable)
 import GHC.Generics (Generic)
-import Network.Socket (Socket, AddrInfo, getAddrInfo, socket, addrFamily, SocketType(..), defaultProtocol, SockAddr, addrAddress, sendTo)
+import Network.Socket (Socket, AddrInfo, getAddrInfo, socket, addrFamily, SocketType(..), defaultProtocol, SockAddr, addrAddress, sendTo, SockAddr(..), AddrInfoFlag(AI_PASSIVE), defaultHints, addrFlags, bindSocket)
 import System.Environment (getArgs)
 import System.Exit (exitWith, ExitCode(..))
 import System.IO (stderr, hPutStrLn)
@@ -24,7 +24,8 @@ data Actor = Self AddrInfo | Peer AddrInfo
 
 data ServerState        = ServerState { state_self  :: Actor
                                       , state_peers :: [Actor]
-                                      , state_sock  :: Socket
+                                      , state_ssock :: Socket
+                                      , state_rsock :: Socket
                                       , state_role  :: Role
                                       , state_term  :: Term
                                       }
@@ -60,12 +61,25 @@ main = do
 run :: Actor -> [Actor] -> IO ()
 run self peers = do
   let Self selfInfo = self
-  let family        = addrFamily selfInfo
-  sock <- socket family Datagram defaultProtocol
+  ssock' <- ssock selfInfo
+  rsock' <- rsock selfInfo
   runStateT (become Follower)
-            (ServerState self peers sock Follower 0)
+            (ServerState self peers ssock' rsock' Follower 0)
   return ()
-
+  where
+    ssock :: AddrInfo -> IO Socket
+    ssock selfInfo = socket (addrFamily selfInfo) Datagram defaultProtocol
+      
+    rsock :: AddrInfo -> IO Socket
+    rsock selfInfo = do
+      let SockAddrInet port _ = addrAddress selfInfo
+      raddrInfo <- fmap head $ getAddrInfo (Just (defaultHints { addrFlags = [ AI_PASSIVE ] }))
+                                           Nothing
+                                           (Just $ show port)
+      rsock <- socket (addrFamily raddrInfo) Datagram defaultProtocol
+      bindSocket rsock (addrAddress raddrInfo)
+      return rsock
+ 
 become :: Role -> ApplicationContext ()
 become Follower  = do
   log "I am follower"
@@ -194,7 +208,7 @@ log = lift . putStrLn
 send :: Message -> SockAddr -> ApplicationContext ()
 send message addr = do
   ctx <- get
-  let sock = state_sock ctx
+  let sock = state_ssock ctx
   lift $ send' sock (show message) addr
   where
     send' _    []      _    = return ()
