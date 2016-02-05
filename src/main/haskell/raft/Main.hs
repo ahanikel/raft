@@ -6,7 +6,9 @@ import Control.Monad.Trans (lift)
 import qualified Data.Set as Set
 import Data.Typeable (Typeable)
 import GHC.Generics (Generic)
-import Network.Socket (Socket, AddrInfo, getAddrInfo, socket, addrFamily, SocketType(..), defaultProtocol, SockAddr, addrAddress, sendTo, SockAddr(..), AddrInfoFlag(AI_PASSIVE), defaultHints, addrFlags, bindSocket)
+import Network.Socket ( Socket, AddrInfo, SocketType(..), SockAddr(..), AddrInfoFlag(AI_PASSIVE)
+                      , getAddrInfo, socket, addrFamily, defaultProtocol, addrAddress, sendTo, defaultHints, addrFlags, bindSocket
+                      )
 import System.Environment (getArgs)
 import System.Exit (exitWith, ExitCode(..))
 import System.IO (stderr, hPutStrLn)
@@ -15,7 +17,7 @@ import Prelude hiding (log)
 data Role               = Leader
                         | Follower
                         | Candidate
-     deriving (Show, Read)
+  deriving (Show, Read)
 
 type Term = Integer
 
@@ -29,25 +31,19 @@ data ServerState        = ServerState { state_self  :: Actor
                                       , state_role  :: Role
                                       , state_term  :: Term
                                       }
-     deriving (Show)
+  deriving (Show)
 
 data Message            = AppendEntries Term [String]
                         | RequestVote   Term
                         | CastVote      Term String
                         | Timeout
-     deriving (Show, Read)
+  deriving (Show, Read)
 
 type ApplicationContext = StateT ServerState IO
 
 type Timeout = Int
 
 ------------------------------------------------
-
-getAddress :: String -> IO AddrInfo
-getAddress addr = getAddrInfo Nothing (Just host) (Just port) >>= returnFirst
-  where
-    (host, (':' : port)) = span (/= ':') addr
-    returnFirst = return . head
 
 main :: IO ()
 main = do
@@ -57,6 +53,12 @@ main = do
     []        -> do hPutStrLn stderr usage
                     exitWith $ ExitFailure 1
     otherwise -> mapM getAddress args >>= \(self : peers) -> run (Self self) (fmap Peer peers)
+
+getAddress :: String -> IO AddrInfo
+getAddress addr = getAddrInfo Nothing (Just host) (Just port) >>= returnFirst
+  where
+    (host, (':' : port)) = span (/= ':') addr
+    returnFirst = return . head
 
 run :: Actor -> [Actor] -> IO ()
 run self peers = do
