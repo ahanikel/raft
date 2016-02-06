@@ -1,13 +1,15 @@
 {-# LANGUAGE DeriveGeneric #-}
 
 import Util (checkIO)
+import Control.Concurrent (ThreadId, forkIO, threadDelay, killThread)
+import Control.Concurrent.MVar (MVar, newMVar, takeMVar, putMVar)
 import Control.Monad.State (StateT, runStateT, get, put)
 import Control.Monad.Trans (lift)
 import qualified Data.Set as Set
 import Data.Typeable (Typeable)
 import GHC.Generics (Generic)
 import Network.Socket ( Socket, AddrInfo, SocketType(..), SockAddr(..), AddrInfoFlag(AI_PASSIVE)
-                      , getAddrInfo, socket, addrFamily, defaultProtocol, addrAddress, sendTo, defaultHints, addrFlags, bindSocket
+                      , getAddrInfo, socket, addrFamily, defaultProtocol, addrAddress, sendTo, defaultHints, addrFlags, bindSocket, recvFrom
                       )
 import System.Environment (getArgs)
 import System.Exit (exitWith, ExitCode(..))
@@ -21,22 +23,28 @@ data Role               = Leader
 
 type Term = Integer
 
-data Actor = Self AddrInfo | Peer AddrInfo
+newtype Address = Address { addr_to_string :: String }
+  deriving (Show, Read, Eq, Ord)
+
+data Actor = Actor { actor_addr :: SockAddr }
   deriving (Show, Eq)
 
-data ServerState        = ServerState { state_self  :: Actor
-                                      , state_peers :: [Actor]
-                                      , state_ssock :: Socket
-                                      , state_rsock :: Socket
-                                      , state_role  :: Role
-                                      , state_term  :: Term
+data ServerState        = ServerState { state_self   :: Actor
+                                      , state_peers  :: [Actor]
+                                      , state_ssock  :: Socket
+                                      , state_rsock  :: Socket
+                                      , state_role   :: Role
+                                      , state_term   :: Term
+                                      , state_squeue :: MVar [String]
+                                      , state_stimer :: MVar Timer
+                                      , state_sthr   :: Maybe ThreadId
+                                      , state_leader :: Maybe Address
                                       }
-  deriving (Show)
 
-data Message            = AppendEntries Term [String]
-                        | RequestVote   Term
-                        | CastVote      Term String
-                        | Timeout
+data Message            = AppendEntries Address Term [String]
+                        | RequestVote   Address Term
+                        | CastVote      Address Term
+                        | Timeout       Address
   deriving (Show, Read)
 
 type ApplicationContext = StateT ServerState IO
@@ -52,21 +60,22 @@ main = do
   case args of
     []        -> do hPutStrLn stderr usage
                     exitWith $ ExitFailure 1
-    otherwise -> mapM getAddress args >>= \(self : peers) -> run (Self self) (fmap Peer peers)
+    otherwise -> mapM getAddressInfo args >>= \(self : peers) -> run self (fmap (Actor . addrAddress) peers)
 
-getAddress :: String -> IO AddrInfo
-getAddress addr = getAddrInfo Nothing (Just host) (Just port) >>= returnFirst
+getAddressInfo :: String -> IO AddrInfo
+getAddressInfo addr = getAddrInfo Nothing (Just host) (Just port) >>= returnFirst
   where
     (host, (':' : port)) = span (/= ':') addr
     returnFirst = return . head
 
-run :: Actor -> [Actor] -> IO ()
-run self peers = do
-  let Self selfInfo = self
+run :: AddrInfo -> [Actor] -> IO ()
+run selfInfo peers = do
   ssock' <- ssock selfInfo
   rsock' <- rsock selfInfo
+  squeue <- newMVar []
+  stimer <- newMVar $ Timer broadcastTimeout 0 (return ())
   runStateT (become Follower)
-            (ServerState self peers ssock' rsock' Follower 0)
+            (ServerState (Actor $ addrAddress selfInfo) peers ssock' rsock' Follower 0 squeue stimer Nothing Nothing)
   return ()
   where
     ssock :: AddrInfo -> IO Socket
@@ -83,36 +92,46 @@ run self peers = do
       return rsock
  
 become :: Role -> ApplicationContext ()
-become Follower  = do
+become Follower = do
   log "I am follower"
   setRole Follower
   handleMessagesAsFollower
 
 become Candidate = do
-  ctx <- get
-  log "I am candidate"
   newTerm
   setRole Candidate
-  broadcast $ RequestVote (state_term ctx)
+  ctx <- get
+  let self = state_self ctx
+  let selfAddr = actor_addr self
+  let term = state_term ctx
+  log "I am candidate"
+  broadcast $ RequestVote (saddr2addr selfAddr) term
   handleMessagesAsCandidate Set.empty
 
-become Leader    = do
+become Leader = do
   log "I am leader"
   setRole Leader
+  installSenderThread
   handleMessagesAsLeader
+
+unbecome Leader = do
+  uninstallSenderThread
 
 handleMessagesAsFollower = do
   ctx <- get
-  (sender, message) <- awaitMessage messageTimeout
+  let self = state_self ctx
+  message <- awaitMessage electionTimeout
   case message of
-    Timeout -> become Candidate
-    AppendEntries term entries | term >= state_term ctx -> do
+    Timeout sender | sender == saddr2addr (actor_addr self) -> become Candidate
+    AppendEntries sender term entries | term >= state_term ctx -> do
       append entries
       if term > state_term ctx
       then setTerm term
       else return ()
+      ctx <- get
+      put $ ctx { state_leader = Just sender }
       handleMessagesAsFollower
-    RequestVote term | term > state_term ctx -> do
+    RequestVote sender term | term > state_term ctx -> do
       setTerm term
       castVote sender
       handleMessagesAsFollower
@@ -120,24 +139,29 @@ handleMessagesAsFollower = do
 
 handleMessagesAsCandidate votes = do
   ctx <- get
+  let self = state_self ctx
   if we_have_a_majority votes ctx
   then become Leader
   else do
-    (sender, message) <- awaitMessage electionTimeout
+    message <- awaitMessage electionTimeout
     case message of
-      CastVote term peer | is_a_peer peer && state_term ctx == term ->
-        handleMessagesAsCandidate $ Set.insert peer votes
-      AppendEntries term entries | term >= state_term ctx -> do
+      CastVote sender term | state_term ctx == term ->
+        handleMessagesAsCandidate $ Set.insert sender votes
+      AppendEntries sender term entries | term >= state_term ctx -> do
         if term > state_term ctx
         then setTerm term
         else return ()
         append entries
+        ctx <- get
+        put $ ctx { state_leader = Just sender }
         become Follower
-      RequestVote term | term > state_term ctx -> do
+      RequestVote sender term | term > state_term ctx -> do
         setTerm term
         castVote sender
+        ctx <- get
+        put $ ctx { state_leader = Nothing }
         become Follower
-      Timeout -> become Candidate
+      Timeout sender | sender == saddr2addr (actor_addr self) -> become Candidate
       otherwise -> handleMessagesAsCandidate votes
   where -- we implicitly vote for ourselves by comparing >=
         -- instead of >
@@ -147,18 +171,21 @@ handleMessagesAsCandidate votes = do
 
 handleMessagesAsLeader = do
   ctx <- get
-  (sender, message) <- awaitMessage messageTimeout
+  message <- awaitMessage broadcastTimeout
   case message of
-    Timeout -> do
-      heartbeat
-      handleMessagesAsLeader
-    AppendEntries term entries | term > state_term ctx -> do
+    AppendEntries sender term entries | term > state_term ctx -> do
       append entries
       setTerm term
+      unbecome Leader
+      ctx <- get
+      put $ ctx { state_leader = Just sender }
       become Follower
-    RequestVote term | term > state_term ctx -> do
+    RequestVote sender term | term > state_term ctx -> do
       setTerm term
       castVote sender
+      unbecome Leader
+      ctx <- get
+      put $ ctx { state_leader = Nothing }
       become Follower
     otherwise -> handleMessagesAsLeader
 
@@ -177,58 +204,132 @@ setRole role = do
   ctx <- get
   put ctx { state_role = role }
 
-awaitMessage :: Timeout -> ApplicationContext (Actor, Message)
-awaitMessage timeout = do
+awaitMessage :: IO Timeout -> ApplicationContext Message
+awaitMessage ioTimeout = do
+  timeout <- lift ioTimeout
   ctx <- get
   let self = state_self ctx
-  let await = lift $ expectTimeout timeout
-  await :: ApplicationContext (Maybe (Actor, Message))
-  mmessage <- await
+  mmessage <- expectTimeout timeout
   case mmessage of
     Just message   -> return message
-    Nothing        -> return (self, Timeout)
+    Nothing        -> return (Timeout $ saddr2addr $ actor_addr self)
 
 -- TODO: choose a random value between 150--300 ms
-electionTimeout :: Timeout
-electionTimeout = 300000
+electionTimeout :: IO Timeout
+electionTimeout = return 8000
 
-messageTimeout :: Timeout
-messageTimeout = 300000
+-- TODO: choose a random value between 0.5--20 ms
+broadcastTimeout :: IO Timeout
+broadcastTimeout = return 1000
 
 -- TODO: implement
 append :: [String] -> ApplicationContext ()
 append entries = return ()
 
-heartbeat :: ApplicationContext ()
-heartbeat = do
-  ctx <- get
-  broadcast $ AppendEntries (state_term ctx) []
-
 log :: String -> ApplicationContext ()
 log = lift . putStrLn
+
+send' :: Socket -> String -> SockAddr -> IO ()
+send' _    []      _    = return ()
+send' sock message addr = do
+  nSent <- sendTo sock message addr
+  putStrLn $ "sending " ++ message
+  send' sock (drop nSent message) addr
 
 send :: Message -> SockAddr -> ApplicationContext ()
 send message addr = do
   ctx <- get
   let sock = state_ssock ctx
   lift $ send' sock (show message) addr
-  where
-    send' _    []      _    = return ()
-    send' sock message addr = do
-      nSent <- sendTo sock message addr
-      send' sock (drop nSent message) addr
 
 broadcast :: Message -> ApplicationContext ()
 broadcast message = do
   ctx <- get
   let peers = state_peers ctx
-  mapM_ (\(Peer peer) -> send message $ addrAddress peer) peers
+  mapM_ (\peer -> send message (actor_addr peer)) peers
 
-castVote :: Actor -> ApplicationContext ()
-castVote recipient = undefined
+castVote :: Address -> ApplicationContext ()
+castVote recipientAddr = do
+  ctx <- get
+  let self = state_self ctx
+  let term = state_term ctx
+  let peers = state_peers ctx
+  let recipient = filter ((== addr_to_string recipientAddr) . show . actor_addr) peers
+  case recipient of
+    []          -> log "ERROR: castVote: recipient not found"
+    [recipient] -> send (CastVote (saddr2addr $ actor_addr self) term) (actor_addr recipient)
+    _           -> log "ERROR: castVote: more than one recipient found"
 
-is_a_peer :: String -> Bool
-is_a_peer peer = undefined
+withTimeout :: Int -> IO () -> IO ThreadId
+withTimeout millis action = forkIO $ do
+  threadDelay (1000 * millis)
+  action
 
-expectTimeout :: Timeout -> IO (Maybe (Actor, Message))
-expectTimeout timeout = undefined
+expectTimeout :: Timeout -> ApplicationContext (Maybe Message)
+expectTimeout timeout = do
+  ctx            <- get
+  let self        = state_self ctx
+  let selfAddr    = actor_addr self
+  timeoutThread  <- lift $ withTimeout timeout $ send' (state_ssock ctx) (show $ Timeout $ saddr2addr selfAddr) selfAddr
+  (msg, _, addr) <- lift $ recvFrom (state_rsock ctx) 1024
+  lift $ killThread timeoutThread
+  result <- case reads msg of
+    []                 -> return Nothing
+    ((message, _) : _) -> return $ Just message
+  log ("got " ++ show result)
+  return result
+
+data Timer = Timer { timer_millis  :: IO Int
+                   , timer_current :: Int
+                   , timer_action  :: IO ()
+                   }
+
+timerThread :: MVar Timer -> IO () -> ApplicationContext ThreadId
+timerThread mvTimer ioAction = do
+  timer  <- lift $ takeMVar mvTimer
+  millis <- lift $ timer_millis timer
+  lift $ putMVar mvTimer $ timer { timer_current = millis }
+  lift $ forkIO loop
+  where
+    loop = do
+      threadDelay 1000
+      timer <- takeMVar mvTimer
+      if timer_current timer <= 1 then do
+        putStrLn "Performing timed action"
+        ioAction
+        millis <- timer_millis timer
+        putMVar mvTimer $ timer { timer_current = millis }
+      else 
+        putMVar mvTimer $ timer { timer_current = timer_current timer - 1 }
+      loop
+
+flushQueue :: Actor -> Term -> MVar [String] -> [Actor] -> Socket -> IO ()
+flushQueue self term mvEntries peers ssock = do
+  entries <- takeMVar mvEntries
+  let message = AppendEntries (saddr2addr $ actor_addr self) term entries
+  mapM_ (send' ssock $ show message) (map actor_addr peers)
+  putMVar mvEntries []
+
+installSenderThread :: ApplicationContext ()
+installSenderThread = do
+  ctx <- get
+  let stimer = state_stimer ctx
+  let self   = state_self ctx
+  let term   = state_term ctx
+  let squeue = state_squeue ctx
+  let peers  = state_peers ctx
+  let ssock  = state_ssock ctx
+  stimerId  <- timerThread stimer $ flushQueue self term squeue peers ssock
+  put $ ctx { state_sthr = Just stimerId }
+
+uninstallSenderThread :: ApplicationContext ()
+uninstallSenderThread = do
+  ctx <- get
+  let m_stimerId = state_sthr ctx
+  case m_stimerId of
+    Just stimerId -> lift $ killThread stimerId
+    Nothing -> log "ERROR: uninstallSenderThread called with no thread running."
+  put $ ctx { state_sthr = Nothing }
+
+saddr2addr :: SockAddr -> Address
+saddr2addr = Address . show
