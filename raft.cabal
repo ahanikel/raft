@@ -16,6 +16,9 @@ cabal-version:       >=1.10
 executable raft
   hs-source-dirs:      src/main/haskell/raft
   main-is:             Main.hs
+  other-modules:       InputOutput
+                     , Net
+                     , Raft
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N
   build-depends:       base
                      , containers
