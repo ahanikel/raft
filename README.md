@@ -11,12 +11,12 @@ as described in https://ramcloud.stanford.edu/raft.pdf
 
 ## In terminal window #1
 
-  .stack-work/install/${arch}/lts-3.1/7.10.2/bin/raft 127.0.0.1:9000 127.0.0.1:9001 127.0.0.1:9002
+  stack exec raft 127.0.0.1:9000 127.0.0.1:9001 127.0.0.1:9002
 
 ## In terminal window #2
 
-  .stack-work/install/${arch}/lts-3.1/7.10.2/bin/raft 127.0.0.1:9001 127.0.0.1:9000 127.0.0.1:9002
+  stack exec raft 127.0.0.1:9001 127.0.0.1:9000 127.0.0.1:9002
 
 ## In terminal window #3
 
-  .stack-work/install/${arch}/lts-3.1/7.10.2/bin/raft 127.0.0.1:9002 127.0.0.1:9000 127.0.0.1:9001
+  stack exec raft 127.0.0.1:9002 127.0.0.1:9000 127.0.0.1:9001
